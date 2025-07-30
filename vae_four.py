@@ -174,7 +174,7 @@ def train_vae(model, dataloader, optimizer, device, beta=0.01, epochs=500):
             total_recon_loss = recon_loss.item()
             total_kl_loss = kl_loss.item()
         if (epoch + 1) % 100 == 0 or epoch == epochs - 1:
-            print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Recon Loss: {total_recon_loss:.4f}, KL Loss: {total_kl_loss:.4f}")
+            print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Recon Loss: {total_recon_loss:.4f}, KL Loss: {total_kl_loss:.4f}", end='\r', flush=True)
 
     return model
 
@@ -314,7 +314,7 @@ def decode_and_inverse_transform(z_pred, vae, scaler, taxa_columns, device='cpu'
 
 # regressor
 
-def encode_latent_means(Y_scaled, vae_model, device='mps'):
+def encode_latent_means(Y_scaled, vae_model, device='mps' if torch.backends.mps.is_available() else 'cpu'):
     """
     Encodes scaled concentration data into VAE latent mean vectors (mu).
     
@@ -496,6 +496,8 @@ def vis_all(path='oleander_data.csv'):
     visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
 
 if __name__ == "__main__":
+    print("Starting VAE training and visualization...")
     # Run the training and evaluation pipeline
-    train_all(path='oleander_data.csv')
-    vis_all(path='oleander_data.csv')
+    filepath = 'data/oleander/ifcb_count_clean.csv'
+    train_all(path=filepath)
+    vis_all(path=filepath)

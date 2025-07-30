@@ -207,3 +207,10 @@ marimo/_lsp/
 __marimo__/
 
 vae_report.json
+
+# Ignore all output in data/ or logs/
+data/
+
+# Ignore all model output
+*.csv
+*.pth
