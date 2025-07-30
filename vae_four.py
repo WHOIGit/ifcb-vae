@@ -32,13 +32,14 @@ def load_data(path):
     Y_raw = df[taxa_columns].copy()
 
     # Step 3: Compute concentrations (handle missing or zero ml_analyzed)
-    ml_analyzed = df['ml_analyzed'].replace(0, np.nan)  # Avoid division by zero
-    Y_conc = Y_raw.div(ml_analyzed, axis=0)
+    # ml_analyzed = df['ml_analyzed'].replace(0, np.nan)  # Avoid division by zero
+    # Y_conc = Y_raw.div(ml_analyzed, axis=0)
 
-    # Optional: Drop samples with missing volume
-    valid_samples = ml_analyzed.notna()
-    Y_conc = Y_conc[valid_samples]
-    X_env = X_env[valid_samples]
+    # # Optional: Drop samples with missing volume
+    # valid_samples = ml_analyzed.notna()
+    # Y_conc = Y_conc[valid_samples]
+    # X_env = X_env[valid_samples]
+    Y_conc = Y_raw.copy() # Input data is already in concentration units
 
     # Step 4: Apply asinh transform (works well for 0s and large values)
     Y_trans = np.arcsinh(Y_conc)
