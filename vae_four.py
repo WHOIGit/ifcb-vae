@@ -45,9 +45,12 @@ def load_data(path):
 
     # Step 5: Standardize each taxon (column-wise)
     # Optionally, filter out columns with too many zeros (e.g., <5% non-zero)
-    min_nonzero_fraction = 0.05
+    min_nonzero_fraction = 0.025
     nonzero_fraction = (Y_conc > 0).mean()
     kept_taxa = nonzero_fraction[nonzero_fraction > min_nonzero_fraction].index
+    # remove taxa with very high mean concentration
+    mean_concentration = Y_conc[kept_taxa].mean()
+    kept_taxa = kept_taxa[mean_concentration < 5]  #
 
     Y_filtered = Y_trans[kept_taxa]
 
@@ -169,14 +172,14 @@ def train_vae(model, dataloader, optimizer, device, beta=0.01, epochs=500):
             total_loss += loss.item()
             total_recon_loss = recon_loss.item()
             total_kl_loss = kl_loss.item()
-        if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
+        if (epoch + 1) % 100 == 0 or epoch == epochs - 1:
             print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Recon Loss: {total_recon_loss:.4f}, KL Loss: {total_kl_loss:.4f}")
 
     return model
 
 
-def visualize_latent_space(vae, Y_scaled, X_env, color_var='temperature',
-                           method='tsne', perplexity=30, random_state=42, device='cpu'):
+def visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=None,
+                           method='pca', perplexity=30, random_state=42, device='cpu'):
     """
     Visualize latent space of a trained VAE using t-SNE, PCA, or UMAP.
 
@@ -192,7 +195,17 @@ def visualize_latent_space(vae, Y_scaled, X_env, color_var='temperature',
     """
     vae.eval()
     vae.to(device)
-    
+
+    # plot the taxax concentrations as a violin plot
+    plt.figure(figsize=(12, 6))
+    plt.violinplot(np.sinh(Y_scaled.values), showmeans=True, showmedians=True)
+    plt.title('Taxa Concentrations Distribution')
+    plt.xlabel('Taxa')
+    plt.ylabel('Scaled Concentration')
+    plt.tight_layout()
+    #plt.show()
+    plt.close()
+
     # Step 1: Encode all samples into latent space
     X_tensor = torch.tensor(Y_scaled.values, dtype=torch.float32)
     mu_list = []
@@ -228,6 +241,39 @@ def visualize_latent_space(vae, Y_scaled, X_env, color_var='temperature',
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+
+    # now make a violin plot of the latent space
+    plt.figure(figsize=(8, 6))
+    plt.violinplot(latent_mu, showmeans=True, showmedians=True)
+    plt.title('Latent Space Distribution')
+    plt.xlabel('Latent Dimensions')
+    plt.ylabel('Value')
+    plt.tight_layout()
+    plt.show()
+
+    # now choose a latent dimention z1
+    # and construct a transect through z1 from its min to its max over n steps where n is 256
+    n_steps = 100
+    for d in range(latent_mu.shape[1]):
+        z_mean = np.tile(np.mean(latent_mu, axis=0), (n_steps, 1))
+        z_mean[:, d] = np.linspace(latent_mu[:, d].min(), latent_mu[:, d].max(), n_steps)
+        # now decode these latent vectors
+        z_transect_tensor = torch.tensor(z_mean, dtype=torch.float32).to(device)
+        # decode
+        recon_transect = decode_and_inverse_transform(z_transect_tensor, vae, scaler, Y_scaled.columns, device=device)
+        # clamp the recon_transect to be non-negative
+        recon_transect = np.clip(recon_transect, 0, None)
+        # now make a stacked plot of the transect with a diferent color for each taxon
+        plt.figure(figsize=(10, 6))
+        x_values = z_mean[:, d]
+        bar_width = np.min(np.diff(x_values))  # Minimum spacing between consecutive x values
+        for i, taxon in enumerate(Y_scaled.columns):
+            plt.bar(x_values, recon_transect[taxon], bottom=recon_transect.iloc[:, :i].sum(axis=1), label=taxon, width=bar_width)
+        plt.title('Transect through Latent Space (z{})'.format(d + 1))
+        plt.xlabel('Latent Dimension z{}'.format(d + 1))
+        plt.ylabel('Reconstructed Concentration')
+        plt.grid(True)
+        plt.show()
 
 def decode_and_inverse_transform(z_pred, vae, scaler, taxa_columns, device='cpu'):
     """
@@ -295,7 +341,7 @@ def encode_latent_means(Y_scaled, vae_model, device='mps'):
     Z_mu = mu.cpu().numpy()
     return Z_mu
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV, train_test_split
 
 def split_regression_data(X_env, Y_conc, Z_target, test_size=0.2, val_size=0.1, random_state=42):
     """
@@ -339,94 +385,116 @@ def split_regression_data(X_env, Y_conc, Z_target, test_size=0.2, val_size=0.1, 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.multioutput import MultiOutputRegressor
 
-def train_random_forest_regressor(X_train, Z_train, n_estimators=100, max_depth=None, random_state=42):
+def train_regressor(X_train, Z_train):
     """
     Trains a multi-output Random Forest Regressor to predict VAE latent means.
-    
+
     Parameters:
         X_train: pandas DataFrame of shape (n_samples, n_features)
         Z_train: numpy array of shape (n_samples, latent_dim)
-        n_estimators: number of trees in the forest
-        max_depth: max depth of each tree (None = full depth)
-        random_state: for reproducibility
 
     Returns:
-        model: trained MultiOutputRegressor instance wrapping RandomForestRegressor
+        Trained MultiOutputRegressor instance
     """
-    base_rf = RandomForestRegressor(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        #random_state=random_state,
+    param_grid = {
+        'estimator__n_estimators': [200],
+        'estimator__max_depth': [None, 20]
+    }
+
+    base_rf = RandomForestRegressor(n_jobs=-1)
+    rf_model = MultiOutputRegressor(base_rf)
+
+    grid_search = GridSearchCV(
+        rf_model,
+        param_grid,
+        cv=3,
+        scoring='r2',
+        verbose=2,
         n_jobs=-1
     )
-    model = MultiOutputRegressor(base_rf)
-    model.fit(X_train, Z_train)
-    return model
 
-if __name__ == '__main__':
-    X, Y, taxa, scaler = load_data('oleander_data.csv')
-    print("Environmental variables:\n", X.head())
-    print("Scaled taxa concentrations:\n", Y.head())
-    print("Taxa names:", taxa)
-    print("Scaler mean:", scaler.mean_)
-    print("Scaler scale:", scaler.scale_)
- 
-    # Assume Y_scaled is a pandas DataFrame of transformed taxa data
-    X_tensor = torch.tensor(Y.values, dtype=torch.float32)
+    grid_search.fit(X_train, Z_train)
+    print("Best parameters:", grid_search.best_params_)
+    print("Best cross-validated R² score:", grid_search.best_score_)
 
-    # stash away the true concentrations for later
-    Y_asinh = scaler.inverse_transform(Y)
-    # Step 2: Inverse asinh transform (→ concentration)
-    Y_true = np.sinh(Y_asinh)
+    return grid_search.best_estimator_
 
-    # Wrap in DataLoader
-    batch_size = 1024 # FIXME: reduce when we're done tuning
+def train_all(path='oleander_data.csv'):
+    X, Y, taxa, scaler = load_data(path)
+
+    # 1. Split the data FIRST (no VAE yet!)
+    Z_dummy = np.zeros((len(Y), 1))  # dummy placeholder
+    splits = split_regression_data(X, Y, Z_dummy, test_size=0.2, val_size=0.1)
+
+    # 2. Train VAE on Y_train only
+    Y_train = splits['Y_train']
+    X_tensor = torch.tensor(Y_train.values, dtype=torch.float32)
     dataset = TensorDataset(X_tensor)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=2048, shuffle=True)
 
-    # Instantiate model and optimizer
     vae = VAE(input_dim=Y.shape[1], latent_dim=8)
     optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
+    train_vae(vae, dataloader, optimizer, epochs=2000, device='mps' if torch.backends.mps.is_available() else 'cpu')
 
-    # Train
-    train_vae(vae, dataloader, optimizer, device='mps' if torch.backends.mps.is_available() else 'cpu')
+    torch.save(vae.state_dict(), 'vae_model.pth')
+    print("VAE model saved.")
 
-    # regressor
-    Z_target = encode_latent_means(Y, vae_model=vae, device='mps' if torch.backends.mps.is_available() else 'cpu')
-    print("Latent targets shape:", Z_target.shape)
+    # 3. Encode all splits using trained VAE
+    Z_train = encode_latent_means(splits['Y_train'], vae)
+    Z_val   = encode_latent_means(splits['Y_val'], vae)
+    Z_test  = encode_latent_means(splits['Y_test'], vae)
 
-    splits = split_regression_data(X, Y_true, Z_target, test_size=0.2, val_size=0.1, random_state=42)
-    print("Train set shape:", splits['X_train'].shape, splits['Z_train'].shape)
-    print("Validation set shape:", splits['X_val'].shape, splits['Z_val'].shape)
-    print("Test set shape:", splits['X_test'].shape, splits['Z_test'].shape)
+    # 4. Train RF using clean split
+    rf_model = train_regressor(splits['X_train'], Z_train)
 
-    # now train the regressor
-    rf_model = train_random_forest_regressor(
-        splits['X_train'], splits['Z_train'], n_estimators=100, max_depth=None, random_state=42
-    )
+    torch.save(rf_model, 'rf_model.pth')
+    print("Random Forest model saved.")
 
-    # now predict on the val set
-    Z_pred = rf_model.predict(splits['X_val'])
-    print("Predicted latent means shape:", Z_pred.shape)
+    # 5. Predict on validation set
+    Z_val_pred = rf_model.predict(splits['X_val'])
+    print("Predicted latent means shape:", Z_val_pred.shape)
     # Decode the predictions back to concentrations
-    Y_pred = decode_and_inverse_transform(
-        Z_pred, vae, scaler, taxa_columns=Y.columns.tolist(), device='mps' if torch.backends.mps.is_available() else 'cpu'
+    Y_val_pred = decode_and_inverse_transform(
+        Z_val_pred, vae, scaler, taxa_columns=Y.columns.tolist(), device='mps' if torch.backends.mps.is_available() else 'cpu'
     )
-    print("Predicted concentrations shape:", Y_pred.shape)
-    Y_val_true = splits['Y_val']
+    print("Predicted concentrations shape:", Y_val_pred.shape)
+    Y_val_true_scaled = splits['Y_val']
+    Y_val_true = np.sinh(scaler.inverse_transform(Y_val_true_scaled))
     print("True concentrations shape:", Y_val_true.shape)
-
-    # produce output CSV including:
-    # 1. sample_time
-    # 2. environmental variables
-    # 3. true concentrations (one column per taxon)
-    # 4. predicted concentrations (one column per taxon)
-
-    # now compute R² scores
+    # make two side by side violin plots of the true and predicted concentrations
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.violinplot(Y_val_true, showmeans=True, showmedians=True)
+    plt.title('True Concentrations (validation set)')
+    plt.xlabel('Taxa')
+    plt.ylabel('Concentration')
+    plt.subplot(1, 2, 2)
+    plt.violinplot(Y_val_pred.values, showmeans=True, showmedians=True)
+    plt.title('Predicted Concentrations (validation set)')
+    plt.xlabel('Taxa')
+    plt.ylabel('Concentration')
+    plt.tight_layout()
+    plt.show()
+    # now compute R^2 scores per taxon
     from sklearn.metrics import r2_score
-    r2_scores = r2_score(Y_val_true, Y_pred, multioutput='raw_values')
+    r2_scores = r2_score(Y_val_true, Y_val_pred, multioutput='raw_values')
     print("R² scores per taxon:", r2_scores)
-    print("Mean R² score:", r2_score(Y_val_true, Y_pred, multioutput='uniform_average'))
-    # visualize
-    #visualize_latent_space(vae, Y, X, color_var='temperature', method='tsne', device='mps' if torch.backends.mps.is_available() else 'cpu')
+    print("Mean R² score:", r2_score(Y_val_true, Y_val_pred, multioutput='uniform_average'))
 
+
+def vis_all(path='oleander_data.csv'):
+    """
+    Main function to run the entire training and evaluation pipeline.
+    """
+    # Load data and preprocess
+    X_env, Y_scaled, taxa_columns, scaler = load_data(path)
+
+    # Visualize latent space
+    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=8)
+    vae.load_state_dict(torch.load('vae_model.pth'))
+    visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
+
+if __name__ == "__main__":
+    # Run the training and evaluation pipeline
+    train_all(path='oleander_data.csv')
+    vis_all(path='oleander_data.csv')
