@@ -211,6 +211,7 @@ vae_report.json
 # Ignore all output in data/ or logs/
 data/
 
-# Ignore all model output
+# Ignore certain file
 *.csv
 *.pth
+*.ipynb
