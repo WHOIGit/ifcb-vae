@@ -113,24 +113,46 @@ def aggregate_cast_data(df, data_cols):
     df = pd.concat([cast_agg, other_data], axis=0, ignore_index=True)
     return df.sort_values('sample_time').reset_index(drop=True)
 
-def normalize_and_collapse(df, taxonomy, data_cols, data_type):
+# def normalize_and_collapse(df, taxonomy, data_cols, data_type):
+#     """
+#     Normalize by volume analyzed and collapse annotations to taxonomy labels.
+#     """
+#     raw_annotations = taxonomy['Annotations'].tolist()
+#     valid_annotations = [col for col in raw_annotations if col in df.columns]
+#     column_map = dict(zip(taxonomy['Annotations'], taxonomy['Label']))
+
+#     df_norm = (
+#         df[valid_annotations]
+#         .div(df['ml_analyzed'], axis=0)
+#         .rename(columns=column_map)
+#         .T.groupby(level=0).sum().T
+#     )
+
+#     df_norm[['x', 'y', 't']] = df[['x', 'y', 't']].values
+#     grouped = df_norm.groupby(['x', 'y', 't']).mean()
+
+#     if data_type == 'count':
+#         grouped = grouped.round(0).astype(int)
+
+#     return grouped.reset_index(drop=True)
+
+def normalize(df, taxonomy, data_cols, data_type):
     """
-    Normalize by volume analyzed and collapse annotations to taxonomy labels.
+    Normalize by volume analyzed
     """
     raw_annotations = taxonomy['Annotations'].tolist()
     valid_annotations = [col for col in raw_annotations if col in df.columns]
-    column_map = dict(zip(taxonomy['Annotations'], taxonomy['Label']))
 
     df_norm = (
         df[valid_annotations]
         .div(df['ml_analyzed'], axis=0)
-        .rename(columns=column_map)
-        .T.groupby(level=0).sum().T
     )
 
-    df_norm[['x', 'y', 't']] = df[['x', 'y', 't']].values
-    grouped = df_norm.groupby(['x', 'y', 't']).mean()
-
+    # df_norm[['x', 'y', 't']] = df[['x', 'y', 't']].values
+    # grouped = df_norm.groupby(['x', 'y', 't']).mean()
+    
+    grouped = df_norm
+    
     if data_type == 'count':
         grouped = grouped.round(0).astype(int)
 
@@ -143,7 +165,7 @@ def process_dataset(workdir, data_type):
     meta, raw, tax = load_data(workdir, data_type)
     df, data_cols = preprocess(meta, raw)
     df = aggregate_cast_data(df, data_cols)
-    df_norm = normalize_and_collapse(df, tax, data_cols, data_type)
+    df_norm = normalize(df, tax, data_cols, data_type)
 
     # Clean and export
     df = df.drop(columns=tax['Annotations'].tolist(), errors='ignore')
