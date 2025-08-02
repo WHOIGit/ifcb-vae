@@ -147,6 +147,7 @@ class VAE(nn.Module):
         for h_dim in hidden_dims:
             encoder_layers.append(nn.Linear(last_dim, h_dim))
             encoder_layers.append(nn.ReLU())
+            # encoder_layers.append(nn.Dropout(p=0.1))  # Add 10% dropout
             last_dim = h_dim
         self.encoder = nn.Sequential(*encoder_layers)
 
@@ -157,9 +158,10 @@ class VAE(nn.Module):
         # Decoder
         decoder_layers = []
         last_dim = latent_dim
-        for h_dim in reversed(hidden_dims):
+        for h_dim in [32]:  # reversed(hidden_dims):
             decoder_layers.append(nn.Linear(last_dim, h_dim))
             decoder_layers.append(nn.ReLU())
+            decoder_layers.append(nn.Dropout(p=0.2))  # Add 20% dropout
             last_dim = h_dim
         decoder_layers.append(nn.Linear(last_dim, input_dim))  # output layer
         self.decoder = nn.Sequential(*decoder_layers)
@@ -184,32 +186,40 @@ class VAE(nn.Module):
         recon = self.decode(z)
         return recon, mu, logvar
 
-def vae_loss(recon_x, x, mu, logvar, beta=0.1):
+def vae_loss(recon_x, x, mu, logvar, beta=0.1, feature_weights=None):
     # Reconstruction loss (MSE)
     recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+
+    # Feature weights for reconstruction loss
+    if feature_weights is not None:
+        recon_loss = (recon_loss * feature_weights).mean()
 
     # KL divergence
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
 
-    return recon_loss + beta * kl_loss, recon_loss, kl_loss
+    latent_centering_loss = torch.mean(mu.pow(2))
+    alpha = 1.0
+    # return recon_loss + beta * kl_loss, recon_loss, kl_loss
+    return recon_loss + (beta * kl_loss) + (alpha * latent_centering_loss), recon_loss, kl_loss
 
-def train_vae(model, dataloader, optimizer, device, beta=0.01, epochs=500):
+def train_vae(model, dataloader, optimizer, device, beta=0.01, epochs=500, feature_weights=None):
     model.train()
     model.to(device)
+    feature_weights = feature_weights.to(device)
     for epoch in range(epochs):
         total_loss = 0
         for batch in dataloader:
             batch = batch[0].to(device)
             optimizer.zero_grad()
             recon, mu, logvar = model(batch)
-            loss, recon_loss, kl_loss = vae_loss(recon, batch, mu, logvar, beta=beta)
+            loss, recon_loss, kl_loss = vae_loss(recon, batch, mu, logvar, beta=beta, feature_weights=feature_weights)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             total_recon_loss = recon_loss.item()
             total_kl_loss = kl_loss.item()
-        if (epoch + 1) % 100 == 0 or epoch == epochs - 1:
-            print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Recon Loss: {total_recon_loss:.4f}, KL Loss: {total_kl_loss:.4f}", end='\r', flush=True)
+        if (epoch + 1) % 50 == 0 or epoch == epochs - 1:
+            print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Recon Loss: {total_recon_loss:.4f}, KL Loss: {total_kl_loss:.4f}", flush=True)
 
     return model
 
@@ -258,6 +268,12 @@ def visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=No
         reducer = TSNE(n_components=2, perplexity=perplexity, random_state=random_state)
     elif method == 'pca':
         reducer = PCA(n_components=2)
+    elif method == 'umap':
+        try:
+            import umap
+            reducer = umap.UMAP(n_components=2, random_state=random_state)
+        except ImportError:
+            raise ImportError("UMAP is not installed. Please install it with 'pip install umap-learn'.")
     else:
         raise ValueError("Method must be 'tsne' or 'pca'.")
 
@@ -277,9 +293,9 @@ def visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=No
     plt.tight_layout()
     plt.show()
 
-    # now make a violin plot of the latent space
+    # now make a box plot of the latent space
     plt.figure(figsize=(8, 6))
-    plt.violinplot(latent_mu, showmeans=True, showmedians=True)
+    plt.boxplot(latent_mu)
     plt.title('Latent Space Distribution')
     plt.xlabel('Latent Dimensions')
     plt.ylabel('Value')
@@ -476,8 +492,25 @@ def train_all(path='ifcb_count_clean.csv'):
     X, Y, taxa, _ = load_data(path)
 
     # === 1. Preprocess Taxa Abundance Data ===
-    scaler = PowerRootStandardScaler(root=3)  # Custom scaler 
-    Y_scaled = scaler.fit_transform(Y)  # Scaled input for VAE
+    # scaler = PowerRootStandardScaler(root=3)  # Custom scaler
+    class IdentityScaler:
+        """
+        Identity scaler that does nothing.
+        Used to skip scaling in this example.
+        """
+        def fit(self, X, y=None):
+            return self
+
+        def transform(self, X):
+            return X
+
+        def fit_transform(self, X, y=None):
+            return X
+
+        def inverse_transform(self, X_scaled):
+            return X_scaled
+    scaler = IdentityScaler()
+    Y_scaled = scaler.fit_transform(Y.values)  # Scaled input for VAE
 
     # === 2. Train/Val/Test Split ===
     # Dummy latent matrix is used for splitting but not needed for training yet
@@ -492,15 +525,66 @@ def train_all(path='ifcb_count_clean.csv'):
     train_dataset = TensorDataset(Y_train_tensor)
     train_loader = DataLoader(train_dataset, batch_size=2048, shuffle=True)
 
+    # prepare taxon weights for loss function
+    # inverse prevalence weights
+    def compute_taxon_weights(y):
+        """
+        Compute weights for each taxon based on inverse prevalence and dynamic range scaling.
+        Assign zero weights to all-zero taxa.
+        """
+        eps = 1e-8  # Small constant to prevent division by zero
+        mean_concentrations = np.mean(y, axis=0)
+        all_zero_mask = (mean_concentrations == 0)
+
+        # Assign zero weights to all-zero taxa
+        weights = np.zeros_like(mean_concentrations)
+        non_zero_mask = ~all_zero_mask
+
+        # Compute prevalence (fraction of non-zero samples for each taxon)
+        prevalence = np.sum(y > 0, axis=0) / y.shape[0]
+
+        # Combine prevalence and mean concentration to compute weights
+        # Higher prevalence and higher mean concentration result in lower weights
+        combined_metric = prevalence[non_zero_mask] * mean_concentrations[non_zero_mask]
+        weights[non_zero_mask] = 1 / (prevalence[non_zero_mask] + eps)
+
+        # Normalize weights for non-zero taxa to sum to 1
+        weights[non_zero_mask] /= np.sum(weights[non_zero_mask])
+
+        # return torch.tensor(weights, dtype=torch.float32)
+
+        # return torch.tensor(weights, dtype=torch.float32)
+
+        # Debugging: Print weights and all-zero taxa
+        print("All-zero taxa:", all_zero_mask)
+        print("Taxon weights:", weights)
+
+        # Plot weights
+        plt.figure(figsize=(10, 5))
+        plt.bar(range(len(weights)), weights, tick_label=taxa)
+        plt.title('Taxon Weights for VAE Loss')
+        plt.xlabel('Taxa')
+        plt.ylabel('Weight')
+        plt.xticks(rotation=90)
+        plt.yscale('log')  # Log scale for better visibility
+        plt.tight_layout()
+        plt.show()
+        plt.close()
+        print("Taxon weights:", weights)
+
+        return torch.tensor(weights, dtype=torch.float32)
+    
+    w = compute_taxon_weights(splits['Y_train'])
+
     # Initialize VAE
-    vae = VAE(input_dim=Y.shape[1], latent_dim=8)
-    optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
+    vae = VAE(input_dim=Y.shape[1], latent_dim=4)
+    optimizer = torch.optim.AdamW(vae.parameters(), lr=1e-3)
 
     # Detect device
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 
     # Train model
-    train_vae(vae, train_loader, optimizer, epochs=2000, device=device)
+    train_vae(vae, train_loader, optimizer, beta=0.01, epochs=5000, feature_weights=w, device=device)
 
     # Save trained model
     torch.save(vae.state_dict(), 'vae_model.pth')
@@ -579,9 +663,10 @@ def vis_all(path='ifcb_count_clean.csv'):
     )
 
     # Visualize latent space
-    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=8)
+    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=4)
     vae.load_state_dict(torch.load('vae_model.pth'))
-    visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
+    #visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
+    visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='umap', device='mps' if torch.backends.mps.is_available() else 'cpu')
 
 if __name__ == "__main__":
     print("Starting VAE training and visualization...")
