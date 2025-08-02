@@ -158,10 +158,10 @@ class VAE(nn.Module):
         # Decoder
         decoder_layers = []
         last_dim = latent_dim
-        for h_dim in [32]:  # reversed(hidden_dims):
+        for h_dim in reversed(hidden_dims):
             decoder_layers.append(nn.Linear(last_dim, h_dim))
             decoder_layers.append(nn.ReLU())
-            decoder_layers.append(nn.Dropout(p=0.2))  # Add 20% dropout
+            # decoder_layers.append(nn.Dropout(p=0.2))  # Add 20% dropout
             last_dim = h_dim
         decoder_layers.append(nn.Linear(last_dim, input_dim))  # output layer
         self.decoder = nn.Sequential(*decoder_layers)
@@ -186,40 +186,61 @@ class VAE(nn.Module):
         recon = self.decode(z)
         return recon, mu, logvar
 
-def vae_loss(recon_x, x, mu, logvar, beta=0.1, feature_weights=None):
+def vae_loss(recon_x, x, mu, logvar, beta=0.1, feature_weights=None, labels=None):
     # Reconstruction loss (MSE)
-    recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+    recon_loss_good = F.mse_loss(recon_x[labels > 0], x[labels > 0], reduction='mean')
+    recon_loss_bad = F.mse_loss(recon_x[labels <= 0], x[labels <= 0], reduction='mean')
 
     # Feature weights for reconstruction loss
     if feature_weights is not None:
-        recon_loss = (recon_loss * feature_weights).mean()
+        recon_loss_good = (recon_loss_good * feature_weights).mean()
+        recon_loss_bad = (recon_loss_bad * (1 - feature_weights)).mean()
 
     # KL divergence
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
 
+    # centering the latent space
     latent_centering_loss = torch.mean(mu.pow(2))
-    alpha = 1.0
+    alpha = 0.1
+    gamma = 0.5 * (recon_loss_good.item() / (recon_loss_bad.item() + 1e-8))
+
+    # FIXME sanity check
+
     # return recon_loss + beta * kl_loss, recon_loss, kl_loss
-    return recon_loss + (beta * kl_loss) + (alpha * latent_centering_loss), recon_loss, kl_loss
+    return recon_loss_good + (beta * kl_loss) + (alpha * latent_centering_loss) + (gamma * recon_loss_bad), \
+              recon_loss_good, recon_loss_bad, kl_loss
 
 def train_vae(model, dataloader, optimizer, device, beta=0.01, epochs=500, feature_weights=None):
     model.train()
     model.to(device)
     feature_weights = feature_weights.to(device)
+    def sigmoid_annealing(epoch, warmup=1000, total_epochs=5000, max_beta=1.0, steepness=5):
+        if epoch < warmup:
+            return 0.
+        else:
+            epoch -= warmup
+            total_epochs -= warmup
+        midpoint = total_epochs / 2
+        return max_beta / (1 + np.exp(-steepness * (epoch - midpoint) / total_epochs))
     for epoch in range(epochs):
+        beta = sigmoid_annealing(epoch, 1000, epochs, max_beta=0.05, steepness=5)
         total_loss = 0
-        for batch in dataloader:
-            batch = batch[0].to(device)
+        for batch, labels in dataloader:
+            batch = batch.to(device)
+            labels = labels.to(device)
             optimizer.zero_grad()
             recon, mu, logvar = model(batch)
-            loss, recon_loss, kl_loss = vae_loss(recon, batch, mu, logvar, beta=beta, feature_weights=feature_weights)
+            loss, recon_loss_good, recon_loss_bad, kl_loss = vae_loss(
+                recon, batch, mu, logvar, beta=beta,
+                feature_weights=feature_weights, labels=labels)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-            total_recon_loss = recon_loss.item()
+            total_recon_loss = recon_loss_good.item()
+            total_bad_loss = recon_loss_bad.item()
             total_kl_loss = kl_loss.item()
         if (epoch + 1) % 50 == 0 or epoch == epochs - 1:
-            print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Recon Loss: {total_recon_loss:.4f}, KL Loss: {total_kl_loss:.4f}", flush=True)
+            print(f"Epoch {epoch+1}, Beta: {beta:.4f}, Loss: {total_loss:.4f}, Recon Loss: {total_recon_loss:.4f}, Bad Recon Loss: {total_bad_loss:.4f}, KL Loss: {total_kl_loss:.4f}", flush=True)
 
     return model
 
@@ -486,6 +507,70 @@ def train_regressor(X_train, Z_train, use_grid_search=False):
         rf_model.fit(X_train, Z_train)
         return rf_model
 
+# prepare taxon weights for loss function
+# inverse prevalence weights
+def compute_taxon_weights(y):
+    """
+    Compute weights for each taxon based on inverse prevalence and dynamic range scaling.
+    Assign zero weights to all-zero taxa.
+    """
+    eps = 1e-8  # Small constant to prevent division by zero
+    mean_concentrations = np.mean(y, axis=0)
+    all_zero_mask = (mean_concentrations == 0)
+
+    # Assign zero weights to all-zero taxa
+    weights = np.zeros_like(mean_concentrations)
+    non_zero_mask = ~all_zero_mask
+
+    # Compute prevalence (fraction of non-zero samples for each taxon)
+    prevalence = np.sum(y > 0, axis=0) / y.shape[0]
+
+    # Combine prevalence and mean concentration to compute weights
+    # Higher prevalence and higher mean concentration result in lower weights
+    combined_metric = prevalence[non_zero_mask] * mean_concentrations[non_zero_mask]
+    weights[non_zero_mask] = 1 / (prevalence[non_zero_mask] + eps)
+
+    # Normalize weights for non-zero taxa to sum to 1
+    weights[non_zero_mask] /= np.sum(weights[non_zero_mask])
+
+    # return torch.tensor(weights, dtype=torch.float32)
+
+    # return torch.tensor(weights, dtype=torch.float32)
+
+    # Debugging: Print weights and all-zero taxa
+    print("All-zero taxa:", all_zero_mask)
+    print("Taxon weights:", weights)
+
+    # Plot weights
+    plt.figure(figsize=(10, 5))
+    plt.bar(range(len(weights)), weights)
+    plt.title('Taxon Weights for VAE Loss')
+    plt.xlabel('Taxa')
+    plt.ylabel('Weight')
+    plt.xticks(rotation=90)
+    plt.yscale('log')  # Log scale for better visibility
+    plt.tight_layout()
+    # plt.show()
+    plt.close()
+    print("Taxon weights:", weights)
+
+    return torch.tensor(weights, dtype=torch.float32)
+
+def generate_implausible_data_by_shuffling(real_data):
+    """
+    Generate implausible data by shuffling taxa within each sample.
+
+    Parameters:
+        real_data (np.ndarray): Real data matrix (n_samples, n_taxa)
+
+    Returns:
+        np.ndarray: Implausible data matrix with shuffled taxa
+    """
+    implausible_data = real_data.copy()
+    for i in range(real_data.shape[0]):
+        implausible_data[i] = np.random.permutation(real_data[i])
+    return implausible_data
+
 # Train and Evaluate the VAE Workflow
 def train_all(path='ifcb_count_clean.csv'):
     # === 0. Load and Prepare Data ===
@@ -521,70 +606,39 @@ def train_all(path='ifcb_count_clean.csv'):
 
     # === 3. Train Variational Autoencoder (VAE) ===
     # Prepare training data
-    Y_train_tensor = torch.tensor(splits['Y_train'], dtype=torch.float32)
-    train_dataset = TensorDataset(Y_train_tensor)
+    Y_train = splits['Y_train']
+    # Y_implausible = generate_implausible_data_by_shuffling(Y_train)
+    Y_labels = np.ones(Y_train.shape[0])  # Labels for real data
+    implausible = True  # Set to True to generate implausible data
+    if implausible:
+        # generate implausible data by shuffling taxa within each sample
+        Y_implausible = generate_implausible_data_by_shuffling(Y_train)
+        Y_implausible_labels = np.zeros(Y_implausible.shape[0])  # Labels for implausible data
+        # Combine real and implausible labels
+        Y_labels = np.concatenate((Y_labels, Y_implausible_labels))
+        Y_train = np.vstack((Y_train, Y_implausible))
+        # now shuffle the data and labels together
+        indices = np.arange(Y_train.shape[0])
+        np.random.shuffle(indices)
+        Y_train = Y_train[indices]
+        Y_labels = Y_labels[indices]
+
+    Y_train_tensor = torch.tensor(Y_train, dtype=torch.float32)
+    Y_labels_tensor = torch.tensor(Y_labels, dtype=torch.float32)
+    train_dataset = TensorDataset(Y_train_tensor, Y_labels_tensor)
     train_loader = DataLoader(train_dataset, batch_size=2048, shuffle=True)
 
-    # prepare taxon weights for loss function
-    # inverse prevalence weights
-    def compute_taxon_weights(y):
-        """
-        Compute weights for each taxon based on inverse prevalence and dynamic range scaling.
-        Assign zero weights to all-zero taxa.
-        """
-        eps = 1e-8  # Small constant to prevent division by zero
-        mean_concentrations = np.mean(y, axis=0)
-        all_zero_mask = (mean_concentrations == 0)
-
-        # Assign zero weights to all-zero taxa
-        weights = np.zeros_like(mean_concentrations)
-        non_zero_mask = ~all_zero_mask
-
-        # Compute prevalence (fraction of non-zero samples for each taxon)
-        prevalence = np.sum(y > 0, axis=0) / y.shape[0]
-
-        # Combine prevalence and mean concentration to compute weights
-        # Higher prevalence and higher mean concentration result in lower weights
-        combined_metric = prevalence[non_zero_mask] * mean_concentrations[non_zero_mask]
-        weights[non_zero_mask] = 1 / (prevalence[non_zero_mask] + eps)
-
-        # Normalize weights for non-zero taxa to sum to 1
-        weights[non_zero_mask] /= np.sum(weights[non_zero_mask])
-
-        # return torch.tensor(weights, dtype=torch.float32)
-
-        # return torch.tensor(weights, dtype=torch.float32)
-
-        # Debugging: Print weights and all-zero taxa
-        print("All-zero taxa:", all_zero_mask)
-        print("Taxon weights:", weights)
-
-        # Plot weights
-        plt.figure(figsize=(10, 5))
-        plt.bar(range(len(weights)), weights, tick_label=taxa)
-        plt.title('Taxon Weights for VAE Loss')
-        plt.xlabel('Taxa')
-        plt.ylabel('Weight')
-        plt.xticks(rotation=90)
-        plt.yscale('log')  # Log scale for better visibility
-        plt.tight_layout()
-        plt.show()
-        plt.close()
-        print("Taxon weights:", weights)
-
-        return torch.tensor(weights, dtype=torch.float32)
-    
     w = compute_taxon_weights(splits['Y_train'])
 
     # Initialize VAE
-    vae = VAE(input_dim=Y.shape[1], latent_dim=4)
+    vae = VAE(input_dim=Y.shape[1], latent_dim=8)
     optimizer = torch.optim.AdamW(vae.parameters(), lr=1e-3)
 
     # Detect device
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 
     # Train model
-    train_vae(vae, train_loader, optimizer, beta=0.01, epochs=5000, feature_weights=w, device=device)
+    train_vae(vae, train_loader, optimizer, beta=0.3, epochs=2000, feature_weights=w, device=device)
 
     # Save trained model
     torch.save(vae.state_dict(), 'vae_model.pth')
@@ -663,7 +717,7 @@ def vis_all(path='ifcb_count_clean.csv'):
     )
 
     # Visualize latent space
-    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=4)
+    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=8)
     vae.load_state_dict(torch.load('vae_model.pth'))
     #visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
     visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='umap', device='mps' if torch.backends.mps.is_available() else 'cpu')
