@@ -201,7 +201,7 @@ def vae_loss(recon_x, x, mu, logvar, beta=0.1, feature_weights=None, labels=None
 
     # centering the latent space
     latent_centering_loss = torch.mean(mu.pow(2))
-    alpha = 0.1
+    alpha = 0
     gamma = 0.5 * (recon_loss_good.item() / (recon_loss_bad.item() + 1e-8))
 
     # FIXME sanity check
@@ -223,7 +223,7 @@ def train_vae(model, dataloader, optimizer, device, beta=0.01, epochs=500, featu
         midpoint = total_epochs / 2
         return max_beta / (1 + np.exp(-steepness * (epoch - midpoint) / total_epochs))
     for epoch in range(epochs):
-        beta = sigmoid_annealing(epoch, 1000, epochs, max_beta=0.05, steepness=5)
+        beta = sigmoid_annealing(epoch, 500, epochs, max_beta=0.5, steepness=5)
         total_loss = 0
         for batch, labels in dataloader:
             batch = batch.to(device)
@@ -612,7 +612,7 @@ def train_all(path='ifcb_count_clean.csv'):
     implausible = True  # Set to True to generate implausible data
     if implausible:
         # generate implausible data by shuffling taxa within each sample
-        Y_implausible = generate_implausible_data_by_shuffling(Y_train)
+        Y_implausible = generate_implausible_data_by_shuffling(Y_train)[:Y_train.shape[0] // 2]  # Take half of the training data
         Y_implausible_labels = np.zeros(Y_implausible.shape[0])  # Labels for implausible data
         # Combine real and implausible labels
         Y_labels = np.concatenate((Y_labels, Y_implausible_labels))
@@ -631,7 +631,7 @@ def train_all(path='ifcb_count_clean.csv'):
     w = compute_taxon_weights(splits['Y_train'])
 
     # Initialize VAE
-    vae = VAE(input_dim=Y.shape[1], latent_dim=8)
+    vae = VAE(input_dim=Y.shape[1], latent_dim=5)
     optimizer = torch.optim.AdamW(vae.parameters(), lr=1e-3)
 
     # Detect device
@@ -717,7 +717,7 @@ def vis_all(path='ifcb_count_clean.csv'):
     )
 
     # Visualize latent space
-    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=8)
+    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=5)
     vae.load_state_dict(torch.load('vae_model.pth'))
     #visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
     visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='umap', device='mps' if torch.backends.mps.is_available() else 'cpu')
