@@ -189,7 +189,11 @@ class VAE(nn.Module):
 def vae_loss(recon_x, x, mu, logvar, beta=0.1, feature_weights=None, labels=None):
     # Reconstruction loss (MSE)
     recon_loss_good = F.mse_loss(recon_x[labels > 0], x[labels > 0], reduction='mean')
-    recon_loss_bad = F.mse_loss(recon_x[labels <= 0], x[labels <= 0], reduction='mean')
+
+    if recon_x[labels == 0].shape[0] == 0:
+        recon_loss_bad = torch.tensor(0.0, device=recon_x.device)
+    else:
+        recon_loss_bad = F.mse_loss(recon_x[labels <= 0], x[labels <= 0], reduction='mean')
 
     # Feature weights for reconstruction loss
     if feature_weights is not None:
@@ -214,16 +218,18 @@ def train_vae(model, dataloader, optimizer, device, beta=0.01, epochs=500, featu
     model.train()
     model.to(device)
     feature_weights = feature_weights.to(device)
-    def sigmoid_annealing(epoch, warmup=1000, total_epochs=5000, max_beta=1.0, steepness=5):
+    def sigmoid_annealing(epoch, total_epochs=10000, max_beta=1.0, steepness=5):
+        warmup = 100
         if epoch < warmup:
-            return 0.
+            return 0
         else:
             epoch -= warmup
             total_epochs -= warmup
-        midpoint = total_epochs / 2
+        midpoint = total_epochs / 3
         return max_beta / (1 + np.exp(-steepness * (epoch - midpoint) / total_epochs))
+    training_curve = []
     for epoch in range(epochs):
-        beta = sigmoid_annealing(epoch, 500, epochs, max_beta=0.5, steepness=5)
+        beta = sigmoid_annealing(epoch, epochs, max_beta=0.01, steepness=100)
         total_loss = 0
         for batch, labels in dataloader:
             batch = batch.to(device)
@@ -239,8 +245,21 @@ def train_vae(model, dataloader, optimizer, device, beta=0.01, epochs=500, featu
             total_recon_loss = recon_loss_good.item()
             total_bad_loss = recon_loss_bad.item()
             total_kl_loss = kl_loss.item()
+            training_curve.append({
+                'epoch': epoch,
+                'beta': beta,
+                'loss': total_loss,
+                'recon_loss_good': total_recon_loss,
+                'recon_loss_bad': total_bad_loss,
+                'kl_loss': total_kl_loss
+            })
         if (epoch + 1) % 50 == 0 or epoch == epochs - 1:
             print(f"Epoch {epoch+1}, Beta: {beta:.4f}, Loss: {total_loss:.4f}, Recon Loss: {total_recon_loss:.4f}, Bad Recon Loss: {total_bad_loss:.4f}, KL Loss: {total_kl_loss:.4f}", flush=True)
+
+    df = pd.DataFrame.from_records(training_curve)
+    df.to_csv('vae_training_curve.csv', index=False)
+    from plot_training_curves import plot_training_curve
+    plot_training_curve(df)
 
     return model
 
@@ -285,34 +304,36 @@ def visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=No
     latent_mu = np.vstack(mu_list)
 
     # Step 2: Dimensionality reduction
-    if method == 'tsne':
-        reducer = TSNE(n_components=2, perplexity=perplexity, random_state=random_state)
-    elif method == 'pca':
-        reducer = PCA(n_components=2)
-    elif method == 'umap':
-        try:
-            import umap
-            reducer = umap.UMAP(n_components=2, random_state=random_state)
-        except ImportError:
-            raise ImportError("UMAP is not installed. Please install it with 'pip install umap-learn'.")
-    else:
-        raise ValueError("Method must be 'tsne' or 'pca'.")
+    for method in ['tsne', 'pca', 'umap']:
+        if method == 'tsne':
+            reducer = TSNE(n_components=2, perplexity=perplexity)
+        elif method == 'pca':
+            reducer = PCA(n_components=2)
+        elif method == 'umap':
+            try:
+                import umap
+                reducer = umap.UMAP(n_components=2)
+            except ImportError:
+                raise ImportError("UMAP is not installed. Please install it with 'pip install umap-learn'.")
+        else:
+            raise ValueError("Method must be 'tsne' or 'pca'.")
 
-    latent_2d = reducer.fit_transform(latent_mu)
+        latent_2d = reducer.fit_transform(latent_mu)
 
-    # Step 3: Plot
-    color_vals = X_env.loc[Y_scaled.index, color_var]
+        # Step 3: Plot
+        color_vals = X_env.loc[Y_scaled.index, color_var]
 
-    plt.figure(figsize=(8, 6))
-    scatter = plt.scatter(latent_2d[:, 0], latent_2d[:, 1],
-                          c=color_vals, cmap='viridis', s=20, alpha=0.8)
-    plt.colorbar(scatter, label=f'{color_var}')
-    plt.title(f'{method.upper()} of VAE Latent Space (colored by {color_var})')
-    plt.xlabel(f'{method.upper()} dim 1')
-    plt.ylabel(f'{method.upper()} dim 2')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+        plt.figure(figsize=(8, 6))
+        scatter = plt.scatter(latent_2d[:, 0], latent_2d[:, 1],
+                            c=color_vals, cmap='viridis', s=20, alpha=0.8)
+        plt.colorbar(scatter, label=f'{color_var}')
+        plt.title(f'{method.upper()} of VAE Latent Space (colored by {color_var})')
+        plt.xlabel(f'{method.upper()} dim 1')
+        plt.ylabel(f'{method.upper()} dim 2')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+        plt.close()
 
     # now make a box plot of the latent space
     plt.figure(figsize=(8, 6))
@@ -328,7 +349,10 @@ def visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=No
     n_steps = 100
     for d in range(latent_mu.shape[1]):
         z_mean = np.tile(np.mean(latent_mu, axis=0), (n_steps, 1))
-        z_mean[:, d] = np.linspace(latent_mu[:, d].min(), latent_mu[:, d].max(), n_steps)
+        # compute the first and third quantile of the latent_mu for this dimension
+        q5 = np.percentile(latent_mu[:, d], 5)
+        q95 = np.percentile(latent_mu[:, d], 95)
+        z_mean[:, d] = np.linspace(q5, q95, n_steps)
         # now decode these latent vectors
         z_transect_tensor = torch.tensor(z_mean, dtype=torch.float32).to(device)
         # decode
@@ -571,6 +595,23 @@ def generate_implausible_data_by_shuffling(real_data):
         implausible_data[i] = np.random.permutation(real_data[i])
     return implausible_data
 
+class IdentityScaler:
+    """
+    Identity scaler that does nothing.
+    Used to skip scaling in this example.
+    """
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return X
+
+    def fit_transform(self, X, y=None):
+        return X
+
+    def inverse_transform(self, X_scaled):
+        return X_scaled
+        
 # Train and Evaluate the VAE Workflow
 def train_all(path='ifcb_count_clean.csv'):
     # === 0. Load and Prepare Data ===
@@ -578,22 +619,7 @@ def train_all(path='ifcb_count_clean.csv'):
 
     # === 1. Preprocess Taxa Abundance Data ===
     # scaler = PowerRootStandardScaler(root=3)  # Custom scaler
-    class IdentityScaler:
-        """
-        Identity scaler that does nothing.
-        Used to skip scaling in this example.
-        """
-        def fit(self, X, y=None):
-            return self
 
-        def transform(self, X):
-            return X
-
-        def fit_transform(self, X, y=None):
-            return X
-
-        def inverse_transform(self, X_scaled):
-            return X_scaled
     scaler = IdentityScaler()
     Y_scaled = scaler.fit_transform(Y.values)  # Scaled input for VAE
 
@@ -631,7 +657,7 @@ def train_all(path='ifcb_count_clean.csv'):
     w = compute_taxon_weights(splits['Y_train'])
 
     # Initialize VAE
-    vae = VAE(input_dim=Y.shape[1], latent_dim=5)
+    vae = VAE(input_dim=Y.shape[1], latent_dim=3)
     optimizer = torch.optim.AdamW(vae.parameters(), lr=1e-3)
 
     # Detect device
@@ -709,7 +735,8 @@ def vis_all(path='ifcb_count_clean.csv'):
     X_env, Y, taxa_columns, _ = load_data(path)
 
     # Apply transformation and scaling
-    scaler = PowerRootStandardScaler(root=3)  # Custom scaler
+    # scaler = PowerRootStandardScaler(root=3)  # Custom scaler
+    scaler = IdentityScaler()  # Use identity scaler for this example
     Y_scaled = pd.DataFrame(
         scaler.fit_transform(Y),
         columns=taxa_columns,
@@ -717,10 +744,10 @@ def vis_all(path='ifcb_count_clean.csv'):
     )
 
     # Visualize latent space
-    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=5)
+    vae = VAE(input_dim=Y_scaled.shape[1], latent_dim=3)
     vae.load_state_dict(torch.load('vae_model.pth'))
-    #visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
-    visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='umap', device='mps' if torch.backends.mps.is_available() else 'cpu')
+    #v isualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
+    visualize_latent_space(vae, Y_scaled, X_env, color_var='salinity', scaler=scaler, method='pca', device='mps' if torch.backends.mps.is_available() else 'cpu')
 
 if __name__ == "__main__":
     print("Starting VAE training and visualization...")
